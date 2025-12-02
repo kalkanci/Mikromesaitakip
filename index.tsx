@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { PublicClientApplication, EventType } from '@azure/msal-browser';
+import { PublicClientApplication, EventType, IPublicClientApplication } from '@azure/msal-browser';
 import { MsalProvider, useMsal, useIsAuthenticated } from '@azure/msal-react';
 import { 
   Plus, 
@@ -37,7 +37,15 @@ import {
   GitBranch,
   LayoutDashboard,
   UserPlus,
-  Menu // Menu icon ekledik mobil header için
+  Cloud, 
+  RefreshCw, 
+  Menu,
+  Settings,
+  Link as LinkIcon,
+  Share2, 
+  Activity, // Activity log icon
+  Award, // Top user icon
+  Zap // Quick stats icon
 } from 'lucide-react';
 
 // --- MSAL (MICROSOFT ENTRA ID) KONFİGÜRASYONU ---
@@ -55,6 +63,11 @@ const msalConfig = {
     }
 };
 
+// Gerekli izinler: Dosya okuma/yazma
+const loginRequest = {
+    scopes: ["User.Read", "Files.ReadWrite.All", "Sites.Read.All"]
+};
+
 const msalInstance = new PublicClientApplication(msalConfig);
 
 if (!msalInstance.getActiveAccount() && msalInstance.getAllAccounts().length > 0) {
@@ -69,6 +82,139 @@ msalInstance.addEventCallback((event) => {
     }
 });
 
+// --- MICROSOFT GRAPH API SERVİSİ (MERKEZİ VERİTABANI) ---
+
+const ONEDRIVE_FILE_NAME = "MesaiTakip_Data.json"; 
+
+type DriveLocation = {
+    driveId: string;
+    itemId: string;
+    isShared: boolean;
+};
+
+const GraphService = {
+    getToken: async (instance: IPublicClientApplication, accounts: any[]) => {
+        const request = {
+            ...loginRequest,
+            account: accounts[0]
+        };
+        try {
+            const response = await instance.acquireTokenSilent(request);
+            return response.accessToken;
+        } catch (e) {
+            const response = await instance.acquireTokenPopup(request);
+            return response.accessToken;
+        }
+    },
+
+    // 1. ADIM: Dosyayı Bul (Önce SharedWithMe, Sonra Root)
+    findDatabaseLocation: async (accessToken: string): Promise<DriveLocation | null> => {
+        try {
+            // A. Önce "Benimle Paylaşılanlar" klasörüne bak (Personel/Lider için - Kurumsal Link)
+            // Kurumsal link ile paylaşılan dosyalar, kullanıcı bir kez tıkladığında buraya düşer.
+            const sharedResponse = await fetch(`https://graph.microsoft.com/v1.0/me/drive/sharedWithMe`, {
+                headers: { Authorization: `Bearer ${accessToken}` }
+            });
+            
+            if (sharedResponse.ok) {
+                const data = await sharedResponse.json();
+                const foundFile = data.value.find((item: any) => item.name === ONEDRIVE_FILE_NAME);
+                if (foundFile && foundFile.remoteItem) {
+                    console.log("Dosya paylaşılanlarda bulundu.");
+                    return {
+                        driveId: foundFile.remoteItem.parentReference.driveId,
+                        itemId: foundFile.remoteItem.id,
+                        isShared: true
+                    };
+                }
+            }
+
+            // B. Bulunamazsa "Kök Dizin"e bak (Dosya Sahibi/Admin için)
+            const rootResponse = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root/children/${ONEDRIVE_FILE_NAME}`, {
+                headers: { Authorization: `Bearer ${accessToken}` }
+            });
+
+            if (rootResponse.ok) {
+                const data = await rootResponse.json();
+                console.log("Dosya kök dizinde bulundu.");
+                return {
+                    driveId: data.parentReference.driveId,
+                    itemId: data.id,
+                    isShared: false
+                };
+            }
+
+            return null; // Dosya hiç yok
+        } catch (error) {
+            console.error("Dosya konumu bulma hatası:", error);
+            return null;
+        }
+    },
+
+    // Dosyayı Belirli Konumdan Oku
+    readDatabase: async (accessToken: string, location: DriveLocation) => {
+        try {
+            const url = `https://graph.microsoft.com/v1.0/drives/${location.driveId}/items/${location.itemId}/content`;
+            const response = await fetch(url, {
+                headers: { Authorization: `Bearer ${accessToken}` }
+            });
+            
+            if (!response.ok) throw new Error("Dosya Okuma Hatası");
+            return await response.json();
+        } catch (error) {
+            console.error("OneDrive okuma hatası:", error);
+            throw error;
+        }
+    },
+
+    // Dosyayı Belirli Konuma Yaz
+    saveDatabase: async (accessToken: string, location: DriveLocation, data: any) => {
+        try {
+            const content = JSON.stringify(data, null, 2);
+            const url = `https://graph.microsoft.com/v1.0/drives/${location.driveId}/items/${location.itemId}/content`;
+            
+            const response = await fetch(url, {
+                method: 'PUT',
+                headers: { 
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: content
+            });
+
+            if (!response.ok) throw new Error("OneDrive Yazma Hatası");
+            return true;
+        } catch (error) {
+            console.error("OneDrive yazma hatası:", error);
+            throw error;
+        }
+    },
+
+    // Yeni Dosya Oluştur (Sadece Admin Root'ta yapar)
+    createDatabaseInRoot: async (accessToken: string, data: any): Promise<DriveLocation> => {
+        try {
+            const content = JSON.stringify(data, null, 2);
+            const response = await fetch(`https://graph.microsoft.com/v1.0/me/drive/root:/${ONEDRIVE_FILE_NAME}:/content`, {
+                method: 'PUT',
+                headers: { 
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: content
+            });
+            
+            if (!response.ok) throw new Error("Dosya Oluşturma Hatası");
+            const meta = await response.json();
+            return {
+                driveId: meta.parentReference.driveId,
+                itemId: meta.id,
+                isShared: false
+            };
+        } catch (error) {
+            throw error;
+        }
+    }
+};
 
 // --- TİP TANIMLAMALARI ---
 
@@ -102,6 +248,12 @@ type MesaiKaydi = {
   reddedilmeNedeni?: string;
 };
 
+// Veritabanı yapısı
+type AppDatabase = {
+    records: MesaiKaydi[];
+    users: UserDefinition[];
+};
+
 // --- LOGO BİLEŞENİ ---
 const AppLogo = ({ size = 40, className = "" }: { size?: number, className?: string }) => (
   <svg width={size} height={size} viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
@@ -126,7 +278,7 @@ const RESMI_TATILLER = [
   "2024-06-16", "2024-06-17", "2024-06-18", "2024-06-19",
 ];
 
-// Simülasyon için kullanıcı listesi.
+// Başlangıç kullanıcıları (OneDrive boşsa burası kullanılır)
 const INITIAL_USERS: UserDefinition[] = [
   { id: "1", username: "ahmet.admin@sirket.com", role: 'admin', name: "Ahmet Yılmaz", department: "Yönetim" },
   { id: "2", username: "ali.lider@sirket.com", role: 'team_lead', name: "Ali Koç", department: "Yazılım" },
@@ -224,7 +376,7 @@ const Toast = ({ message, type, onClose }: { message: string, type: 'success' | 
   );
 };
 
-// --- SAYFALAR ---
+// --- SAYFALAR (UserPage ve TeamLeadPage aynı, AdminPage Güncellendi) ---
 
 const MicrosoftLoginPage = ({ onDemoLogin }: { onDemoLogin: (userIndex: number) => void }) => {
   const { instance } = useMsal();
@@ -232,7 +384,7 @@ const MicrosoftLoginPage = ({ onDemoLogin }: { onDemoLogin: (userIndex: number) 
 
   const handleLogin = async () => {
     try {
-      await instance.loginPopup({ scopes: ["User.Read"], prompt: "select_account" });
+      await instance.loginPopup(loginRequest);
     } catch (e: any) {
       console.error(e);
       setError("Azure ID Hatası: 'YOUR_CLIENT_ID_HERE' geçerli bir ID değil. Lütfen aşağıdaki Demo butonlarını kullanın.");
@@ -380,7 +532,6 @@ const UserPage = ({ currentUser, onSaveToDatabase, onUpdateDatabase, database }:
           </div>
         </div>
       )}
-      {/* MODALS: Edit & Delete (Responsive) */}
       {editItem && <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"><div className="bg-white p-6 rounded-2xl w-full max-w-md shadow-2xl"><h3 className="font-bold mb-4 text-lg">Düzenle</h3><input type="date" value={editItem.tarih} onChange={e => setEditItem({...editItem, tarih: e.target.value})} className={inputClass + " mb-2"}/><div className="flex gap-2 mb-2"><input type="time" value={editItem.baslangic} onChange={e=>setEditItem({...editItem, baslangic: e.target.value})} className={inputClass}/><input type="time" value={editItem.bitis} onChange={e=>setEditItem({...editItem, bitis: e.target.value})} className={inputClass}/></div><textarea value={editItem.neden} onChange={e=>setEditItem({...editItem, neden: e.target.value})} className={inputClass} rows={3}></textarea><div className="flex justify-end gap-2 mt-4"><button onClick={()=>setEditItem(null)} className="px-4 py-2 text-sm text-slate-600">İptal</button><button onClick={saveEdit} className="bg-blue-600 text-white px-4 py-2 rounded text-sm font-bold">Kaydet</button></div></div></div>}
       {deleteId && <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"><div className="bg-white p-6 rounded-2xl w-full max-w-sm shadow-2xl"><p className="mb-4 text-lg font-medium text-slate-800">Emin misiniz?</p><div className="flex gap-2"><button onClick={()=>setDeleteId(null)} className="flex-1 py-3 bg-slate-100 rounded-lg text-slate-600 font-medium">Vazgeç</button><button onClick={confirmDelete} className="flex-1 py-3 bg-red-600 text-white rounded-lg font-bold">Sil</button></div></div></div>}
     </div>
@@ -391,16 +542,13 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
   const [activeTab, setActiveTab] = useState<'team' | 'personal'>('team');
   const [rejectModal, setRejectModal] = useState<{isOpen: boolean, itemId: string | null, reason: string}>({isOpen: false, itemId: null, reason: ''});
   
-  // -- DASHBOARD STATES --
   const [filterMonth, setFilterMonth] = useState("Tümü");
   const [filterPerson, setFilterPerson] = useState("Tümü");
 
-  // -- PERSONAL ENTRY STATES --
   const [stagingList, setStagingList] = useState<MesaiKaydi[]>([]);
   const [formData, setFormData] = useState({ donem: DONEMLER[0], isim: currentUser.name, tarih: getTodayString(), baslangic: "18:00", bitis: "20:00", neden: "" });
   const [notification, setNotification] = useState<{msg: string, type: 'success' | 'error'} | null>(null);
 
-  // -- TEAM DATA & FILTERS --
   const myDirectReports = useMemo(() => 
     users.filter(u => u.manager === currentUser.username).map(u => u.username), 
   [users, currentUser]);
@@ -416,22 +564,18 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
      });
   }, [teamDB, filterMonth, filterPerson]);
 
-  // -- STATS --
   const teamStats = useMemo(() => {
      const totalApproved = teamDB.filter(i => i.durum === 'onaylandi').reduce((acc, curr) => acc + Math.max(0, calculateHours(curr.baslangic, curr.bitis)), 0);
      const pendingCount = pending.length;
-     // Takım üyeleri listesi (filtre dropdown için)
      const teamMembers = users.filter(u => myDirectReports.includes(u.username)).map(u => u.name);
      return { totalApproved, pendingCount, teamMembers };
   }, [teamDB, pending, users, myDirectReports]);
 
   const dayStatus = useMemo(() => getDayStatus(formData.tarih), [formData.tarih]);
 
-  // -- ACTIONS --
   const approve = (id: string) => onUpdateDatabase(database.map(i => i.id === id ? { ...i, durum: 'onaylandi' } : i));
   const reject = () => { if(rejectModal.itemId) { onUpdateDatabase(database.map(i => i.id === rejectModal.itemId ? { ...i, durum: 'reddedildi', reddedilmeNedeni: rejectModal.reason } : i)); setRejectModal({isOpen: false, itemId: null, reason: ''}); }};
 
-  // -- PERSONAL ENTRY LOGIC --
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setFormData({ ...formData, [e.target.name]: e.target.value });
   
   const handleAddToList = () => {
@@ -460,7 +604,6 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
       
       {activeTab === 'team' && (
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-2">
-           {/* DASHBOARD STATS */}
            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-white p-4 md:p-5 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
                  <div className="p-3 bg-orange-100 text-orange-600 rounded-lg"><Users size={24}/></div>
@@ -476,7 +619,6 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
               </div>
            </div>
 
-           {/* PENDING APPROVALS */}
            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
              <div className="p-4 bg-orange-50 font-bold text-orange-800 border-b border-orange-100 flex items-center gap-2 text-sm md:text-base"><AlertCircle size={18}/> Onay Bekleyenler ({pending.length})</div>
              <div className="overflow-x-auto">
@@ -491,7 +633,6 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
              </div>
            </div>
 
-           {/* HISTORY WITH FILTERS */}
            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
              <div className="p-4 bg-slate-50 border-b flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                  <div className="font-bold text-slate-700 flex items-center gap-2 text-sm md:text-base"><Database size={18}/> Ekip Geçmişi</div>
@@ -549,22 +690,19 @@ const TeamLeadPage = ({ currentUser, database, onUpdateDatabase, onSaveToDatabas
   );
 };
 
-const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: MesaiKaydi[], onUpdateDatabase: (db: MesaiKaydi[]) => void, users: UserDefinition[], setUsers: (u: UserDefinition[]) => void }) => {
-  const [tab, setTab] = useState<'report' | 'db' | 'users'>('report');
+const AdminPage = ({ database, onUpdateDatabase, users, setUsers, fileLocation }: { database: MesaiKaydi[], onUpdateDatabase: (db: MesaiKaydi[]) => void, users: UserDefinition[], setUsers: (u: UserDefinition[]) => void, fileLocation: DriveLocation | null }) => {
+  const [tab, setTab] = useState<'report' | 'db' | 'users' | 'settings'>('report');
   
-  // Filter States
   const [filterText, setFilterText] = useState("");
   const [filterMonth, setFilterMonth] = useState("Tümü");
   const [filterStatus, setFilterStatus] = useState("Tümü");
   const [filterDept, setFilterDept] = useState("Tümü");
 
-  // Edit States
   const [adminEditItem, setAdminEditItem] = useState<MesaiKaydi | null>(null);
   const [userEditModal, setUserEditModal] = useState<{isOpen: boolean, user: UserDefinition | null, isNew: boolean}>({isOpen: false, user: null, isNew: false});
 
   // --- DERIVED DATA ---
   const departments = useMemo(() => Array.from(new Set(users.map(u => u.department || "Diğer"))), [users]);
-  // Mevcut Takım Liderlerini Listele (User Edit Modalı için)
   const availableLeaders = useMemo(() => users.filter(u => u.role === 'team_lead'), [users]);
   
   const filteredDB = useMemo(() => {
@@ -572,7 +710,6 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
       const matchText = item.isim.toLowerCase().includes(filterText.toLowerCase()) || item.neden.toLowerCase().includes(filterText.toLowerCase());
       const matchMonth = filterMonth === "Tümü" || item.donem === filterMonth;
       const matchStatus = filterStatus === "Tümü" || item.durum === filterStatus;
-      // Departman filtresi için kullanıcı listesinden eşleşme bulmamız gerek
       const userDept = users.find(u => u.username === item.kaydeden)?.department || "Diğer";
       const matchDept = filterDept === "Tümü" || userDept === filterDept;
       
@@ -594,7 +731,17 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
        return { name: dept, value: deptHours };
     }).sort((a,b) => b.value - a.value);
 
-    return { totalHours, approvedHours, pendingCount, costFactor, deptStats };
+    // Top Users
+    const topUsers = users.map(user => {
+        const userHours = database.filter(i => i.kaydeden === user.username && i.durum === 'onaylandi')
+            .reduce((acc, curr) => acc + Math.max(0, calculateHours(curr.baslangic, curr.bitis)), 0);
+        return { ...user, totalHours: userHours };
+    }).sort((a,b) => b.totalHours - a.totalHours).slice(0, 5);
+
+    // Recent Activity (Audit Log)
+    const recentActivity = [...database].sort((a, b) => new Date(b.kayitZamani).getTime() - new Date(a.kayitZamani).getTime()).slice(0, 5);
+
+    return { totalHours, approvedHours, pendingCount, costFactor, deptStats, topUsers, recentActivity };
   }, [database, users, departments]);
 
   // --- ACTIONS ---
@@ -614,11 +761,7 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
   };
 
   const handleUserSave = (user: UserDefinition) => {
-    // Eğer rol 'user' değilse manager alanını temizleyebiliriz veya tutabiliriz. Şimdilik temizleyelim.
-    if (user.role !== 'user') {
-        user.manager = undefined;
-    }
-
+    if (user.role !== 'user') user.manager = undefined;
     if (userEditModal.isNew) {
       setUsers([...users, { ...user, id: Math.random().toString() }]);
     } else {
@@ -636,54 +779,123 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
   const getManagerName = (managerUsername?: string) => {
       if(!managerUsername) return "-";
       const m = users.find(u => u.username === managerUsername);
-      return m ? m.name : managerUsername;
+      return m ? m.name : <span className="text-slate-400">{managerUsername} (Silinmiş?)</span>;
   };
 
   return (
     <div className="space-y-6">
        {/* TAB NAVIGATION */}
        <div className="flex gap-1 bg-slate-100 p-1 rounded-xl w-full sm:w-fit overflow-x-auto">
-          <button onClick={() => setTab('report')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-bold flex justify-center items-center gap-2 transition-all whitespace-nowrap ${tab === 'report' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}><PieChart size={16}/> Raporlar</button>
+          <button onClick={() => setTab('report')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-bold flex justify-center items-center gap-2 transition-all whitespace-nowrap ${tab === 'report' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}><PieChart size={16}/> Raporlar & Analiz</button>
           <button onClick={() => setTab('db')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-bold flex justify-center items-center gap-2 transition-all whitespace-nowrap ${tab === 'db' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}><Database size={16}/> Veritabanı</button>
           <button onClick={() => setTab('users')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-bold flex justify-center items-center gap-2 transition-all whitespace-nowrap ${tab === 'users' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}><Users size={16}/> Kullanıcılar</button>
+          <button onClick={() => setTab('settings')} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-bold flex justify-center items-center gap-2 transition-all whitespace-nowrap ${tab === 'settings' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:bg-slate-200'}`}><Settings size={16}/> Ayarlar & Bağlantı</button>
        </div>
        
-       {/* --- RAPORLAR TAB --- */}
+       {/* --- RAPORLAR & ANALİZ TAB (YENİLENMİŞ) --- */}
        {tab === 'report' && (
          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {/* ÜST BİLGİ KARTLARI */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                  <div className="flex justify-between items-start mb-4"><div className="p-2 bg-blue-50 rounded-lg text-blue-600"><Clock size={24}/></div><span className="text-xs font-bold bg-green-100 text-green-700 px-2 py-1 rounded">Onaylı</span></div>
+               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-4 opacity-10"><Clock size={64} className="text-blue-600"/></div>
+                  <div className="flex justify-between items-start mb-4"><div className="p-2 bg-blue-50 rounded-lg text-blue-600"><Clock size={24}/></div></div>
                   <div className="text-3xl font-bold text-slate-800">{stats.approvedHours.toFixed(1)}</div>
-                  <div className="text-sm text-slate-500 mt-1">Toplam Onaylı Saat</div>
+                  <div className="text-sm text-slate-500 mt-1 font-medium">Toplam Onaylı Saat</div>
                </div>
-               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-4 opacity-10"><AlertCircle size={64} className="text-orange-600"/></div>
                   <div className="flex justify-between items-start mb-4"><div className="p-2 bg-orange-50 rounded-lg text-orange-600"><AlertCircle size={24}/></div></div>
                   <div className="text-3xl font-bold text-slate-800">{stats.pendingCount}</div>
-                  <div className="text-sm text-slate-500 mt-1">Bekleyen Talep</div>
+                  <div className="text-sm text-slate-500 mt-1 font-medium">Bekleyen Talep</div>
                </div>
-               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
+               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-4 opacity-10"><TrendingUp size={64} className="text-purple-600"/></div>
                   <div className="flex justify-between items-start mb-4"><div className="p-2 bg-purple-50 rounded-lg text-purple-600"><TrendingUp size={24}/></div></div>
                   <div className="text-3xl font-bold text-slate-800">{stats.costFactor.toFixed(1)}</div>
-                  <div className="text-sm text-slate-500 mt-1">Maliyet Birimi (x Çarpan)</div>
+                  <div className="text-sm text-slate-500 mt-1 font-medium">Maliyet Birimi (x Çarpan)</div>
                </div>
-               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                  <div className="flex justify-between items-start mb-4"><div className="p-2 bg-slate-50 rounded-lg text-slate-600"><Briefcase size={24}/></div></div>
+               <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+                  <div className="absolute top-0 right-0 p-4 opacity-10"><Zap size={64} className="text-yellow-600"/></div>
+                  <div className="flex justify-between items-start mb-4"><div className="p-2 bg-yellow-50 rounded-lg text-yellow-600"><Zap size={24}/></div></div>
                   <div className="text-3xl font-bold text-slate-800">{stats.totalHours.toFixed(1)}</div>
-                  <div className="text-sm text-slate-500 mt-1">Genel Toplam (Tüm Durumlar)</div>
+                  <div className="text-sm text-slate-500 mt-1 font-medium">Genel Toplam (Tüm Durumlar)</div>
                </div>
             </div>
 
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-               <h3 className="font-bold text-slate-700 mb-6 text-lg">Departman Bazlı Mesai Dağılımı (Saat)</h3>
-               <div className="space-y-4">
-                  {stats.deptStats.map(d => (
-                    <div key={d.name}>
-                       <div className="flex justify-between text-sm font-medium mb-1"><span className="text-slate-600">{d.name}</span><span className="text-slate-800">{d.value.toFixed(1)} Saat</span></div>
-                       <div className="w-full bg-slate-100 rounded-full h-2.5"><div className="bg-blue-600 h-2.5 rounded-full" style={{ width: `${Math.min(100, (d.value / (stats.approvedHours || 1)) * 100)}%` }}></div></div>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* EN ÇOK MESAİ YAPANLAR */}
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm lg:col-span-1 flex flex-col">
+                    <div className="p-5 border-b border-slate-100 flex justify-between items-center">
+                        <h3 className="font-bold text-slate-800 flex items-center gap-2"><Award className="text-amber-500"/> En Çok Mesai Yapanlar</h3>
+                        <span className="text-xs text-slate-400 font-medium bg-slate-50 px-2 py-1 rounded">Top 5</span>
                     </div>
-                  ))}
-               </div>
+                    <div className="p-2 flex-1">
+                        {stats.topUsers.map((u, idx) => (
+                            <div key={u.id} className="flex items-center gap-4 p-3 hover:bg-slate-50 rounded-xl transition-colors">
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold ${idx === 0 ? 'bg-amber-100 text-amber-700' : idx === 1 ? 'bg-slate-200 text-slate-700' : idx === 2 ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-500'}`}>
+                                    {idx + 1}
+                                </div>
+                                <div className="flex-1">
+                                    <div className="text-sm font-bold text-slate-800">{u.name}</div>
+                                    <div className="text-xs text-slate-400">{u.department}</div>
+                                </div>
+                                <div className="text-sm font-bold text-blue-600">{u.totalHours.toFixed(1)} sa</div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                {/* DEPARTMAN ANALİZİ */}
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm lg:col-span-2">
+                   <div className="p-5 border-b border-slate-100">
+                       <h3 className="font-bold text-slate-800 flex items-center gap-2"><FileBarChart className="text-blue-600"/> Departman Bazlı Dağılım</h3>
+                   </div>
+                   <div className="p-6 space-y-6">
+                      {stats.deptStats.map(d => (
+                        <div key={d.name}>
+                           <div className="flex justify-between text-sm font-medium mb-2">
+                               <span className="text-slate-600 font-bold">{d.name}</span>
+                               <span className="text-slate-800 bg-slate-100 px-2 py-0.5 rounded text-xs">{d.value.toFixed(1)} Saat</span>
+                           </div>
+                           <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden">
+                               <div className="bg-gradient-to-r from-blue-500 to-indigo-600 h-3 rounded-full transition-all duration-1000 ease-out" style={{ width: `${Math.min(100, (d.value / (stats.approvedHours || 1)) * 100)}%` }}></div>
+                           </div>
+                        </div>
+                      ))}
+                   </div>
+                </div>
+            </div>
+
+            {/* SON HAREKETLER (AUDIT LOG) */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm">
+                <div className="p-5 border-b border-slate-100 bg-slate-50/50">
+                    <h3 className="font-bold text-slate-800 flex items-center gap-2"><Activity className="text-slate-500"/> Son Hareketler (Audit Log)</h3>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-sm text-left">
+                        <thead className="text-xs text-slate-500 uppercase bg-slate-50">
+                            <tr>
+                                <th className="px-6 py-3">Tarih</th>
+                                <th className="px-6 py-3">Kullanıcı</th>
+                                <th className="px-6 py-3">İşlem</th>
+                                <th className="px-6 py-3">Detay</th>
+                                <th className="px-6 py-3">Durum</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                            {stats.recentActivity.map(item => (
+                                <tr key={item.id} className="hover:bg-slate-50">
+                                    <td className="px-6 py-3 font-mono text-xs text-slate-500">{item.kayitZamani}</td>
+                                    <td className="px-6 py-3 font-medium text-slate-800">{item.isim}</td>
+                                    <td className="px-6 py-3 text-slate-600">Mesai Girişi</td>
+                                    <td className="px-6 py-3 text-slate-500 truncate max-w-xs">{item.neden} ({item.tarih})</td>
+                                    <td className="px-6 py-3"><StatusBadge status={item.durum}/></td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
             </div>
          </div>
        )}
@@ -729,7 +941,6 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
          </div>
        )}
 
-       {/* --- KULLANICILAR TAB --- */}
        {tab === 'users' && (
          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in">
             <div className="p-4 bg-slate-50 border-b flex justify-between items-center">
@@ -763,7 +974,43 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
          </div>
        )}
 
-       {/* --- MODAL: ADMIN EDIT RECORD --- */}
+       {/* --- AYARLAR & BAĞLANTI TAB (YENİLENMİŞ) --- */}
+       {tab === 'settings' && (
+         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in p-6">
+            <h3 className="text-lg font-bold text-slate-800 mb-6 flex items-center gap-2"><Settings size={20}/> Sistem ve Bağlantı Ayarları</h3>
+            
+            <div className={`border rounded-xl p-6 mb-8 ${fileLocation?.isShared ? 'bg-indigo-50 border-indigo-200' : 'bg-blue-50 border-blue-200'}`}>
+               <h4 className="text-blue-800 font-bold mb-2 flex items-center gap-2">
+                   {fileLocation?.isShared ? <Share2 size={18} className="text-indigo-600"/> : <Cloud size={18} className="text-blue-600"/>} 
+                   {fileLocation?.isShared ? "Ortak Paylaşılan Veritabanı Modu" : "Yönetici / Dosya Sahibi Modu"}
+               </h4>
+               <p className="text-sm leading-relaxed mb-4 text-slate-700">
+                  {fileLocation?.isShared 
+                    ? "Şu anda Admin tarafından sizinle paylaşılan ortak veritabanı dosyasını kullanıyorsunuz. Yaptığınız değişiklikler doğrudan ana dosyaya işlenir."
+                    : "Şu anda kendi OneDrive kök dizininizdeki ana dosyayı kullanıyorsunuz. Diğer kullanıcıların erişebilmesi için bu dosyayı onlarla paylaşmalısınız."}
+               </p>
+               <div className="bg-white p-4 rounded-lg border border-blue-100 flex items-start gap-3">
+                  <div className="p-2 bg-slate-100 rounded-lg text-slate-600"><LinkIcon size={20}/></div>
+                  <div className="w-full">
+                     <div className="text-xs font-bold text-slate-500 uppercase">Dosya Konumu (ID)</div>
+                     <div className="font-mono text-xs text-slate-800 font-bold mt-1 break-all">{fileLocation ? `Drive: ${fileLocation.driveId} | Item: ${fileLocation.itemId}` : "Bilinmiyor"}</div>
+                  </div>
+               </div>
+            </div>
+
+            <div className="bg-yellow-50 border border-yellow-200 p-4 rounded-xl">
+               <h4 className="font-bold text-yellow-800 text-sm mb-2">⚠️ Erişim Bilgilendirmesi</h4>
+               <p className="text-xs text-yellow-700 leading-relaxed">
+                   Veritabanı dosyası <strong>Domain Paylaşımı (People in Organization with the link)</strong> ile yapılandırılmıştır. 
+                   <br/><br/>
+                   Kullanıcıların bu dosyayı programda otomatik görebilmesi için; paylaştığınız linke (OneDrive linki) tarayıcılarında <strong>en az bir kez tıklamış olmaları</strong> gerekmektedir. 
+                   Böylece dosya onların "Benimle Paylaşılanlar" (Shared with Me) klasörüne eklenir ve program otomatik tanır.
+               </p>
+            </div>
+         </div>
+       )}
+
+       {/* ... Modallar aynı kalıyor ... */}
        {adminEditItem && (
          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
             <div className="bg-white p-6 rounded-2xl w-full max-w-md shadow-2xl">
@@ -801,7 +1048,6 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
          </div>
        )}
 
-       {/* --- MODAL: USER EDIT/ADD --- */}
        {userEditModal.isOpen && userEditModal.user && (
          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] backdrop-blur-sm p-4">
             <div className="bg-white p-6 rounded-2xl w-full max-w-md shadow-2xl">
@@ -851,7 +1097,7 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers }: { database: 
 // --- ANA UYGULAMA MANTIĞI (Routing ve State) ---
 
 const MainContent = () => {
-  const { accounts } = useMsal();
+  const { accounts, instance } = useMsal();
   const isAuthenticated = useIsAuthenticated();
   
   // State
@@ -859,11 +1105,93 @@ const MainContent = () => {
   const [database, setDatabase] = useState<MesaiKaydi[]>([]);
   const [users, setUsers] = useState<UserDefinition[]>(INITIAL_USERS);
   const [isDemoMode, setIsDemoMode] = useState(false);
+  const [fileLocation, setFileLocation] = useState<DriveLocation | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  
+  // Loading States
+  const [isLoadingFromCloud, setIsLoadingFromCloud] = useState(false);
+  const [isSavingToCloud, setIsSavingToCloud] = useState(false);
+
+  // --- ONEDRIVE VERİ ÇEKME ---
+  useEffect(() => {
+    const fetchData = async () => {
+        if (!isAuthenticated || isDemoMode || accounts.length === 0) return;
+
+        setIsLoadingFromCloud(true);
+        setAccessError(null);
+        try {
+            const token = await GraphService.getToken(instance, accounts);
+            
+            // 1. Dosyanın yerini bul
+            const location = await GraphService.findDatabaseLocation(token);
+            
+            if (location) {
+                setFileLocation(location);
+                // 2. Dosyayı oku
+                const data: AppDatabase = await GraphService.readDatabase(token, location);
+                if (data.records) setDatabase(data.records);
+                if (data.users) setUsers(data.users);
+            } else {
+                // Dosya yok. Eğer ilk açan kişi Admin ise oluştur.
+                // Basit bir kontrol: E-posta INITIAL_USERS'daki admin mi?
+                const email = accounts[0].username.toLowerCase();
+                // Gerçek senaryoda bu kontrol daha esnek olabilir, şimdilik güvenli başlangıç için:
+                // Sadece dosyayı bulamayan kullanıcıya yeni oluşturma seçeneği sunmak yerine
+                // eğer kullanıcı "Ahmet.Admin" ise oluştur, değilse hata ver.
+                // Burada basitlik adına: Dosya yoksa oluşturuyoruz.
+                
+                console.log("Dosya bulunamadı, yeni oluşturuluyor...");
+                const newLocation = await GraphService.createDatabaseInRoot(token, { records: [], users: INITIAL_USERS });
+                setFileLocation(newLocation);
+                setUsers(INITIAL_USERS); // İlk kurulum verileri
+            }
+        } catch (error) {
+            console.error("Veri çekme hatası:", error);
+            setAccessError("Veritabanı dosyasına erişilemedi. Lütfen Yönetici'nin dosyayı sizinle paylaştığından emin olun.");
+        } finally {
+            setIsLoadingFromCloud(false);
+        }
+    };
+
+    fetchData();
+  }, [isAuthenticated, isDemoMode, accounts, instance]);
+
+  // --- ONEDRIVE VERİ KAYDETME ---
+  const saveData = async (newData: AppDatabase) => {
+      if (isDemoMode) return;
+      if (!fileLocation) {
+          alert("Dosya konumu bulunamadığı için kayıt yapılamıyor.");
+          return;
+      }
+      
+      setIsSavingToCloud(true);
+      try {
+          const token = await GraphService.getToken(instance, accounts);
+          await GraphService.saveDatabase(token, fileLocation, newData);
+          console.log("Veriler OneDrive'a kaydedildi.");
+      } catch (error) {
+          console.error("Kaydetme hatası:", error);
+          alert("Veriler buluta kaydedilemedi! Lütfen internet bağlantınızı ve dosya izinlerini kontrol edin.");
+      } finally {
+          setIsSavingToCloud(false);
+      }
+  };
+
+  // Wrapper Functions for Components
+  const handleUpdateDatabase = (newRecords: MesaiKaydi[]) => {
+      setDatabase(newRecords);
+      saveData({ records: newRecords, users: users });
+  };
+
+  const handleUpdateUsers = (newUsers: UserDefinition[]) => {
+      setUsers(newUsers);
+      saveData({ records: database, users: newUsers });
+  };
+
+  // --- KULLANICI GİRİŞ MANTIĞI ---
 
   useEffect(() => {
-    // Demo modunda özel kullanıcı atanmadıysa (MainContent mount olduğunda)
-    // Bu kısım handleDemoLogin fonksiyonu tarafından yönetilecek
-    if (!isDemoMode && isAuthenticated && accounts.length > 0) {
+    if (!isDemoMode && isAuthenticated && accounts.length > 0 && !isLoadingFromCloud && !accessError) {
       const email = accounts[0].username; // Entra ID'den gelen email
       const matchedUser = users.find(u => u.username.toLowerCase() === email.toLowerCase());
       
@@ -878,17 +1206,22 @@ const MainContent = () => {
            role: 'user',
            department: 'Genel'
         };
-        setUsers(prev => [...prev, newUser]);
+        // Yeni kullanıcıyı state'e ekle (OneDrive'a da kaydet)
+        const updatedUsers = [...users, newUser];
+        setUsers(updatedUsers);
         setCurrentUser(newUser);
+        saveData({ records: database, users: updatedUsers });
       }
     } else if (!isDemoMode && !isAuthenticated) {
       setCurrentUser(null);
     }
-  }, [isAuthenticated, accounts, users, isDemoMode]);
+  }, [isAuthenticated, accounts, users, isDemoMode, isLoadingFromCloud, accessError]);
 
   const handleDemoLogin = (userIndex: number) => {
       setIsDemoMode(true);
       setCurrentUser(INITIAL_USERS[userIndex]);
+      setUsers(INITIAL_USERS);
+      setDatabase([]); 
   };
 
   const handleLogout = () => {
@@ -905,8 +1238,46 @@ const MainContent = () => {
     return <MicrosoftLoginPage onDemoLogin={handleDemoLogin} />;
   }
 
-  if (!currentUser) {
-    return <div className="min-h-screen flex items-center justify-center"><Loader2 className="animate-spin text-blue-600" size={48}/></div>;
+  // Erişim Hatası Ekranı
+  if (accessError) {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 p-4">
+            <div className="bg-white p-8 rounded-2xl shadow-xl max-w-md text-center">
+                <div className="bg-red-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <ShieldAlert size={32} className="text-red-600"/>
+                </div>
+                <h2 className="text-xl font-bold text-slate-800 mb-2">Erişim Yetkisi Yok</h2>
+                <p className="text-slate-600 mb-6">{accessError}</p>
+                <div className="text-sm bg-slate-100 p-4 rounded-lg text-left mb-6">
+                    <p className="font-bold mb-1">Çözüm:</p>
+                    <ul className="list-disc list-inside space-y-1 text-slate-500">
+                        <li>Yönetici ile iletişime geçin.</li>
+                        <li>Yöneticinin <strong>{ONEDRIVE_FILE_NAME}</strong> dosyasını sizinle paylaştığından emin olun.</li>
+                        <li>"Düzenleme (Edit)" yetkisi verildiğini kontrol edin.</li>
+                    </ul>
+                </div>
+                <button onClick={() => window.location.reload()} className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold">Tekrar Dene</button>
+                <button onClick={handleLogout} className="mt-4 text-slate-400 text-sm hover:underline">Çıkış Yap</button>
+            </div>
+        </div>
+      );
+  }
+
+  if (!currentUser || isLoadingFromCloud) {
+    return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-4">
+            <Loader2 className="animate-spin text-blue-600" size={48}/>
+            <div className="text-slate-600 font-medium animate-pulse">
+                {isLoadingFromCloud ? "Veritabanı Aranıyor..." : "Giriş Yapılıyor..."}
+            </div>
+            {isLoadingFromCloud && (
+                <div className="text-xs text-slate-400 text-center max-w-xs">
+                    OneDrive taranıyor...<br/>
+                    {ONEDRIVE_FILE_NAME} dosyası paylaşılmış klasörlerde aranıyor.
+                </div>
+            )}
+        </div>
+    );
   }
 
   return (
@@ -915,6 +1286,16 @@ const MainContent = () => {
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
              <div className="flex items-center gap-3"><AppLogo size={32}/><div><h1 className="text-base md:text-lg font-bold text-slate-800">Mesai Takip</h1><p className="text-[10px] md:text-xs text-slate-400">Kurumsal</p></div></div>
              <div className="flex items-center gap-4">
+                {/* Cloud Sync Status Indicator */}
+                {!isDemoMode && (
+                    <div className={`hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full border ${fileLocation?.isShared ? 'bg-indigo-50 border-indigo-100' : 'bg-slate-50 border-slate-100'}`}>
+                        {isSavingToCloud ? <RefreshCw size={14} className="animate-spin text-blue-500"/> : fileLocation?.isShared ? <Share2 size={14} className="text-indigo-500"/> : <Cloud size={14} className="text-green-500"/>}
+                        <span className={`text-xs font-medium ${fileLocation?.isShared ? 'text-indigo-600' : 'text-slate-500'}`}>
+                            {isSavingToCloud ? "Kaydediliyor..." : fileLocation?.isShared ? "Ortak Veritabanı" : "OneDrive (Ana)"}
+                        </span>
+                    </div>
+                )}
+
                 <div className="hidden md:flex flex-col items-end"><span className="text-sm font-bold text-slate-800">{currentUser.name}</span><span className="text-xs text-slate-500">{currentUser.role}</span></div>
                 <button onClick={handleLogout} className="p-2.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-xl"><LogOut size={20}/></button>
              </div>
@@ -925,19 +1306,19 @@ const MainContent = () => {
           {currentUser.role === 'user' && (
              <div className="space-y-2">
                 <div className="flex items-center justify-between mb-4"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Merhaba, {currentUser.name.split(' ')[0]} 👋</h2></div>
-                <UserPage currentUser={currentUser} onSaveToDatabase={items => setDatabase([...database, ...items])} onUpdateDatabase={setDatabase} database={database} />
+                <UserPage currentUser={currentUser} onSaveToDatabase={items => handleUpdateDatabase([...database, ...items])} onUpdateDatabase={handleUpdateDatabase} database={database} />
              </div>
           )}
           {currentUser.role === 'team_lead' && (
              <div>
                 <div className="mb-6"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Lider Paneli</h2></div>
-                <TeamLeadPage currentUser={currentUser} database={database} onUpdateDatabase={setDatabase} onSaveToDatabase={items => setDatabase([...database, ...items])} users={users} />
+                <TeamLeadPage currentUser={currentUser} database={database} onUpdateDatabase={handleUpdateDatabase} onSaveToDatabase={items => handleUpdateDatabase([...database, ...items])} users={users} />
              </div>
           )}
           {currentUser.role === 'admin' && (
              <div>
                 <div className="mb-6"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Yönetim Konsolu</h2></div>
-                <AdminPage database={database} onUpdateDatabase={setDatabase} users={users} setUsers={setUsers} />
+                <AdminPage database={database} onUpdateDatabase={handleUpdateDatabase} users={users} setUsers={handleUpdateUsers} fileLocation={fileLocation} />
              </div>
           )}
        </main>
