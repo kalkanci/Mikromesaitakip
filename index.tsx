@@ -387,7 +387,11 @@ const MicrosoftLoginPage = ({ onDemoLogin }: { onDemoLogin: (userIndex: number) 
       await instance.loginPopup(loginRequest);
     } catch (e: any) {
       console.error(e);
-      setError("Azure ID Hatası: 'YOUR_CLIENT_ID_HERE' geçerli bir ID değil. Lütfen aşağıdaki Demo butonlarını kullanın.");
+      if (e.errorCode === 'user_cancelled') {
+        setError("Giriş işlemi iptal edildi.");
+      } else {
+        setError("Azure ID Hatası: 'YOUR_CLIENT_ID_HERE' geçerli bir ID değil. Lütfen aşağıdaki Demo butonlarını kullanın.");
+      }
     }
   };
 
@@ -1094,233 +1098,184 @@ const AdminPage = ({ database, onUpdateDatabase, users, setUsers, fileLocation }
   );
 };
 
-// --- ANA UYGULAMA MANTIĞI (Routing ve State) ---
-
 const MainContent = () => {
-  const { accounts, instance } = useMsal();
+  const { instance, accounts } = useMsal();
   const isAuthenticated = useIsAuthenticated();
-  
-  // State
+
   const [currentUser, setCurrentUser] = useState<UserDefinition | null>(null);
   const [database, setDatabase] = useState<MesaiKaydi[]>([]);
   const [users, setUsers] = useState<UserDefinition[]>(INITIAL_USERS);
-  const [isDemoMode, setIsDemoMode] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [fileLocation, setFileLocation] = useState<DriveLocation | null>(null);
-  const [accessError, setAccessError] = useState<string | null>(null);
-  
-  // Loading States
-  const [isLoadingFromCloud, setIsLoadingFromCloud] = useState(false);
-  const [isSavingToCloud, setIsSavingToCloud] = useState(false);
 
-  // --- ONEDRIVE VERİ ÇEKME ---
+  // Load data from OneDrive when authenticated
   useEffect(() => {
-    const fetchData = async () => {
-        if (!isAuthenticated || isDemoMode || accounts.length === 0) return;
-
-        setIsLoadingFromCloud(true);
-        setAccessError(null);
+    const loadData = async () => {
+      if (isAuthenticated && accounts.length > 0) {
+        setLoading(true);
         try {
-            const token = await GraphService.getToken(instance, accounts);
-            
-            // 1. Dosyanın yerini bul
-            const location = await GraphService.findDatabaseLocation(token);
-            
-            if (location) {
-                setFileLocation(location);
-                // 2. Dosyayı oku
-                const data: AppDatabase = await GraphService.readDatabase(token, location);
-                if (data.records) setDatabase(data.records);
-                if (data.users) setUsers(data.users);
-            } else {
-                // Dosya yok. Eğer ilk açan kişi Admin ise oluştur.
-                // Basit bir kontrol: E-posta INITIAL_USERS'daki admin mi?
-                const email = accounts[0].username.toLowerCase();
-                // Gerçek senaryoda bu kontrol daha esnek olabilir, şimdilik güvenli başlangıç için:
-                // Sadece dosyayı bulamayan kullanıcıya yeni oluşturma seçeneği sunmak yerine
-                // eğer kullanıcı "Ahmet.Admin" ise oluştur, değilse hata ver.
-                // Burada basitlik adına: Dosya yoksa oluşturuyoruz.
-                
-                console.log("Dosya bulunamadı, yeni oluşturuluyor...");
-                const newLocation = await GraphService.createDatabaseInRoot(token, { records: [], users: INITIAL_USERS });
-                setFileLocation(newLocation);
-                setUsers(INITIAL_USERS); // İlk kurulum verileri
-            }
+          const token = await GraphService.getToken(instance, accounts);
+          const location = await GraphService.findDatabaseLocation(token);
+          setFileLocation(location);
+
+          let data: AppDatabase;
+          if (location) {
+            data = await GraphService.readDatabase(token, location);
+          } else {
+             // Dosya bulunamadı, varsayılan veri ile başlatılabilir veya boş
+             // Ancak user kaydederse oluşturulacak.
+             // Şimdilik okuma hatası olmasın diye boş başlatıyoruz.
+             data = { records: [], users: INITIAL_USERS };
+          }
+
+          setDatabase(data.records || []);
+          setUsers(data.users || INITIAL_USERS);
+          
+          const email = accounts[0].username.toLowerCase();
+          const currentUsersList = data.users || INITIAL_USERS;
+          const foundUser = currentUsersList.find(u => u.username.toLowerCase() === email);
+          
+          if (foundUser) {
+            setCurrentUser(foundUser);
+          } else {
+             // Yeni kullanıcı oluştur
+             const newUser: UserDefinition = {
+                 id: Math.random().toString(),
+                 username: email,
+                 name: accounts[0].name || "Yeni Kullanıcı",
+                 role: 'user',
+                 department: 'Genel'
+             };
+             setCurrentUser(newUser);
+             setUsers(prev => [...prev, newUser]);
+          }
+
         } catch (error) {
-            console.error("Veri çekme hatası:", error);
-            setAccessError("Veritabanı dosyasına erişilemedi. Lütfen Yönetici'nin dosyayı sizinle paylaştığından emin olun.");
+          console.error("Veri yükleme hatası:", error);
+          // Hata durumunda sessiz kalıyoruz, UI'da belki gösterilebilir.
         } finally {
-            setIsLoadingFromCloud(false);
+          setLoading(false);
         }
+      }
     };
 
-    fetchData();
-  }, [isAuthenticated, isDemoMode, accounts, instance]);
+    loadData();
+  }, [isAuthenticated, accounts, instance]);
 
-  // --- ONEDRIVE VERİ KAYDETME ---
-  const saveData = async (newData: AppDatabase) => {
-      if (isDemoMode) return;
-      if (!fileLocation) {
-          alert("Dosya konumu bulunamadığı için kayıt yapılamıyor.");
-          return;
-      }
+  const handleUpdateDatabase = async (newRecords: MesaiKaydi[], newUsers?: UserDefinition[]) => {
+      const recordsToSave = newRecords;
+      const usersToSave = newUsers || users;
       
-      setIsSavingToCloud(true);
-      try {
-          const token = await GraphService.getToken(instance, accounts);
-          await GraphService.saveDatabase(token, fileLocation, newData);
-          console.log("Veriler OneDrive'a kaydedildi.");
-      } catch (error) {
-          console.error("Kaydetme hatası:", error);
-          alert("Veriler buluta kaydedilemedi! Lütfen internet bağlantınızı ve dosya izinlerini kontrol edin.");
-      } finally {
-          setIsSavingToCloud(false);
+      setDatabase(recordsToSave);
+      if(newUsers) setUsers(usersToSave);
+
+      // If online (authenticated via MSAL), save to OneDrive
+      if (isAuthenticated && accounts.length > 0) {
+          try {
+              const token = await GraphService.getToken(instance, accounts);
+              const dataToSave: AppDatabase = { records: recordsToSave, users: usersToSave };
+              
+              if (fileLocation) {
+                  await GraphService.saveDatabase(token, fileLocation, dataToSave);
+              } else {
+                  // File didn't exist, create it now
+                  const newLoc = await GraphService.createDatabaseInRoot(token, dataToSave);
+                  setFileLocation(newLoc);
+              }
+          } catch (error) {
+              console.error("Kaydetme hatası:", error);
+              alert("Veriler buluta kaydedilemedi!");
+          }
       }
   };
-
-  // Wrapper Functions for Components
-  const handleUpdateDatabase = (newRecords: MesaiKaydi[]) => {
-      setDatabase(newRecords);
-      saveData({ records: newRecords, users: users });
-  };
-
-  const handleUpdateUsers = (newUsers: UserDefinition[]) => {
-      setUsers(newUsers);
-      saveData({ records: database, users: newUsers });
-  };
-
-  // --- KULLANICI GİRİŞ MANTIĞI ---
-
-  useEffect(() => {
-    if (!isDemoMode && isAuthenticated && accounts.length > 0 && !isLoadingFromCloud && !accessError) {
-      const email = accounts[0].username; // Entra ID'den gelen email
-      const matchedUser = users.find(u => u.username.toLowerCase() === email.toLowerCase());
-      
-      if (matchedUser) {
-        setCurrentUser(matchedUser);
-      } else {
-        // Sistemde kayıtlı değilse misafir/standart kullanıcı olarak ekle
-        const newUser: UserDefinition = {
-           id: Math.random().toString(),
-           username: email,
-           name: accounts[0].name || "Misafir Kullanıcı",
-           role: 'user',
-           department: 'Genel'
-        };
-        // Yeni kullanıcıyı state'e ekle (OneDrive'a da kaydet)
-        const updatedUsers = [...users, newUser];
-        setUsers(updatedUsers);
-        setCurrentUser(newUser);
-        saveData({ records: database, users: updatedUsers });
-      }
-    } else if (!isDemoMode && !isAuthenticated) {
-      setCurrentUser(null);
-    }
-  }, [isAuthenticated, accounts, users, isDemoMode, isLoadingFromCloud, accessError]);
 
   const handleDemoLogin = (userIndex: number) => {
-      setIsDemoMode(true);
-      setCurrentUser(INITIAL_USERS[userIndex]);
+      const user = INITIAL_USERS[userIndex];
+      setCurrentUser(user);
       setUsers(INITIAL_USERS);
-      setDatabase([]); 
+      // Demo verileri
+      const mockData: MesaiKaydi[] = [
+          {id: '101', donem: 'Ocak 2024', isim: 'Mehmet Demir', tarih: '2024-01-15', baslangic: '18:00', bitis: '20:00', neden: 'Proje teslimi', kaydeden: 'mehmet.user@sirket.com', kayitZamani: '2024-01-15 20:05', durum: 'onaylandi', mesaiTuru: 'Normal', carpan: 1.0},
+          {id: '102', donem: 'Şubat 2024', isim: 'Ayşe Kara', tarih: '2024-02-10', baslangic: '09:00', bitis: '13:00', neden: 'Haftasonu çalışması', kaydeden: 'ayse.user@sirket.com', kayitZamani: '2024-02-10 13:10', durum: 'bekliyor', mesaiTuru: 'Hafta Sonu', carpan: 1.5},
+          {id: '103', donem: 'Mart 2024', isim: 'Mehmet Demir', tarih: '2024-03-20', baslangic: '18:00', bitis: '21:00', neden: 'Acil düzeltme', kaydeden: 'mehmet.user@sirket.com', kayitZamani: '2024-03-20 21:05', durum: 'reddedildi', reddedilmeNedeni: 'Mesai onayı alınmamış', mesaiTuru: 'Normal', carpan: 1.0}
+      ];
+      setDatabase(mockData);
   };
-
+  
   const handleLogout = () => {
-     if (isDemoMode) {
-         setIsDemoMode(false);
-         setCurrentUser(null);
-     } else {
-         msalInstance.logoutPopup();
-         setCurrentUser(null);
-     }
+      if (isAuthenticated) {
+          instance.logoutPopup();
+      }
+      setCurrentUser(null);
+      setDatabase([]);
   };
 
-  if (!isAuthenticated && !isDemoMode) {
-    return <MicrosoftLoginPage onDemoLogin={handleDemoLogin} />;
-  }
-
-  // Erişim Hatası Ekranı
-  if (accessError) {
+  if (loading) {
       return (
-        <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 p-4">
-            <div className="bg-white p-8 rounded-2xl shadow-xl max-w-md text-center">
-                <div className="bg-red-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <ShieldAlert size={32} className="text-red-600"/>
-                </div>
-                <h2 className="text-xl font-bold text-slate-800 mb-2">Erişim Yetkisi Yok</h2>
-                <p className="text-slate-600 mb-6">{accessError}</p>
-                <div className="text-sm bg-slate-100 p-4 rounded-lg text-left mb-6">
-                    <p className="font-bold mb-1">Çözüm:</p>
-                    <ul className="list-disc list-inside space-y-1 text-slate-500">
-                        <li>Yönetici ile iletişime geçin.</li>
-                        <li>Yöneticinin <strong>{ONEDRIVE_FILE_NAME}</strong> dosyasını sizinle paylaştığından emin olun.</li>
-                        <li>"Düzenleme (Edit)" yetkisi verildiğini kontrol edin.</li>
-                    </ul>
-                </div>
-                <button onClick={() => window.location.reload()} className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold">Tekrar Dene</button>
-                <button onClick={handleLogout} className="mt-4 text-slate-400 text-sm hover:underline">Çıkış Yap</button>
-            </div>
-        </div>
+          <div className="min-h-screen flex items-center justify-center bg-slate-50">
+              <div className="text-center">
+                  <Loader2 size={48} className="animate-spin text-blue-600 mx-auto mb-4"/>
+                  <h2 className="text-lg font-bold text-slate-700">Veriler Yükleniyor...</h2>
+                  <p className="text-slate-400 text-sm">Microsoft OneDrive bağlantısı kuruluyor</p>
+              </div>
+          </div>
       );
   }
 
-  if (!currentUser || isLoadingFromCloud) {
-    return (
-        <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-4">
-            <Loader2 className="animate-spin text-blue-600" size={48}/>
-            <div className="text-slate-600 font-medium animate-pulse">
-                {isLoadingFromCloud ? "Veritabanı Aranıyor..." : "Giriş Yapılıyor..."}
-            </div>
-            {isLoadingFromCloud && (
-                <div className="text-xs text-slate-400 text-center max-w-xs">
-                    OneDrive taranıyor...<br/>
-                    {ONEDRIVE_FILE_NAME} dosyası paylaşılmış klasörlerde aranıyor.
-                </div>
-            )}
-        </div>
-    );
+  if (!currentUser) {
+      return <MicrosoftLoginPage onDemoLogin={handleDemoLogin} />;
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 pb-10">
-       <header className="bg-white border-b border-slate-200 sticky top-0 z-[100] shadow-sm">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-             <div className="flex items-center gap-3"><AppLogo size={32}/><div><h1 className="text-base md:text-lg font-bold text-slate-800">Mesai Takip</h1><p className="text-[10px] md:text-xs text-slate-400">Kurumsal</p></div></div>
-             <div className="flex items-center gap-4">
-                {/* Cloud Sync Status Indicator */}
-                {!isDemoMode && (
-                    <div className={`hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full border ${fileLocation?.isShared ? 'bg-indigo-50 border-indigo-100' : 'bg-slate-50 border-slate-100'}`}>
-                        {isSavingToCloud ? <RefreshCw size={14} className="animate-spin text-blue-500"/> : fileLocation?.isShared ? <Share2 size={14} className="text-indigo-500"/> : <Cloud size={14} className="text-green-500"/>}
-                        <span className={`text-xs font-medium ${fileLocation?.isShared ? 'text-indigo-600' : 'text-slate-500'}`}>
-                            {isSavingToCloud ? "Kaydediliyor..." : fileLocation?.isShared ? "Ortak Veritabanı" : "OneDrive (Ana)"}
-                        </span>
-                    </div>
-                )}
-
-                <div className="hidden md:flex flex-col items-end"><span className="text-sm font-bold text-slate-800">{currentUser.name}</span><span className="text-xs text-slate-500">{currentUser.role}</span></div>
-                <button onClick={handleLogout} className="p-2.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-xl"><LogOut size={20}/></button>
-             </div>
-          </div>
+    <div className="min-h-screen bg-slate-100 pb-10">
+       <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm">
+           <div className="max-w-7xl mx-auto px-4 h-16 md:h-20 flex items-center justify-between">
+               <div className="flex items-center gap-3">
+                   <div className="bg-blue-600 p-2 rounded-xl text-white shadow-lg shadow-blue-200"><AppLogo size={24} className="text-white"/></div>
+                   <div>
+                       <h1 className="font-bold text-lg md:text-xl text-slate-800 leading-tight">Mesai Takip</h1>
+                       <div className="text-[10px] md:text-xs text-slate-400 font-medium tracking-wide">KURUMSAL PORTAL</div>
+                   </div>
+               </div>
+               <div className="flex items-center gap-3 md:gap-6">
+                   <div className="hidden md:flex flex-col items-end">
+                       <span className="font-bold text-sm text-slate-700">{currentUser.name}</span>
+                       <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">{currentUser.role === 'admin' ? 'Yönetici' : currentUser.role === 'team_lead' ? 'Takım Lideri' : 'Personel'}</span>
+                   </div>
+                   <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all" title="Çıkış Yap">
+                       <LogOut size={20}/>
+                   </button>
+               </div>
+           </div>
        </header>
 
-       <main className="max-w-7xl mx-auto mt-6 md:mt-8 px-4 sm:px-6 lg:px-8">
-          {currentUser.role === 'user' && (
-             <div className="space-y-2">
-                <div className="flex items-center justify-between mb-4"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Merhaba, {currentUser.name.split(' ')[0]} 👋</h2></div>
-                <UserPage currentUser={currentUser} onSaveToDatabase={items => handleUpdateDatabase([...database, ...items])} onUpdateDatabase={handleUpdateDatabase} database={database} />
-             </div>
-          )}
-          {currentUser.role === 'team_lead' && (
-             <div>
-                <div className="mb-6"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Lider Paneli</h2></div>
-                <TeamLeadPage currentUser={currentUser} database={database} onUpdateDatabase={handleUpdateDatabase} onSaveToDatabase={items => handleUpdateDatabase([...database, ...items])} users={users} />
-             </div>
-          )}
-          {currentUser.role === 'admin' && (
-             <div>
-                <div className="mb-6"><h2 className="text-xl md:text-2xl font-bold text-slate-800">Yönetim Konsolu</h2></div>
-                <AdminPage database={database} onUpdateDatabase={handleUpdateDatabase} users={users} setUsers={handleUpdateUsers} fileLocation={fileLocation} />
-             </div>
-          )}
+       <main className="max-w-7xl mx-auto px-4 py-6 md:py-8">
+           {currentUser.role === 'user' && (
+               <UserPage 
+                  currentUser={currentUser} 
+                  database={database} 
+                  onSaveToDatabase={(items) => handleUpdateDatabase([...database, ...items])}
+                  onUpdateDatabase={(newDB) => handleUpdateDatabase(newDB)}
+               />
+           )}
+           {currentUser.role === 'team_lead' && (
+               <TeamLeadPage
+                  currentUser={currentUser}
+                  database={database}
+                  users={users}
+                  onSaveToDatabase={(items) => handleUpdateDatabase([...database, ...items])}
+                  onUpdateDatabase={(newDB) => handleUpdateDatabase(newDB)}
+               />
+           )}
+           {currentUser.role === 'admin' && (
+               <AdminPage
+                  database={database}
+                  users={users}
+                  setUsers={(newUsers) => handleUpdateDatabase(database, newUsers)}
+                  onUpdateDatabase={(newDB) => handleUpdateDatabase(newDB)}
+                  fileLocation={fileLocation}
+               />
+           )}
        </main>
     </div>
   );
